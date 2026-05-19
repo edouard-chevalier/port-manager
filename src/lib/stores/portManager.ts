@@ -4,8 +4,11 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AggregateStatus,
   Config,
+  PortlessDiscoveryResult,
+  PortlessGateway,
   PortStatusInfo,
   Profile,
+  ProfileMode,
   SshHostEntry,
 } from "../types";
 
@@ -18,6 +21,13 @@ export const config = writable<Config>({
       host: "",
       user: "",
       ssh_port: 22,
+      mode: "ports",
+      portless: {
+        base_local_port: 8100,
+        scheme: "https",
+        hosts: [],
+        gateways: [],
+      },
       ports: [],
       rate_limit_max: 6,
       rate_limit_window_secs: 30,
@@ -44,6 +54,13 @@ export const activeProfile = derived<typeof config, Profile>(
         host: "",
         user: "",
         ssh_port: 22,
+        mode: "ports",
+        portless: {
+          base_local_port: 8100,
+          scheme: "https",
+          hosts: [],
+          gateways: [],
+        },
         ports: [],
         rate_limit_max: 6,
         rate_limit_window_secs: 30,
@@ -115,6 +132,51 @@ export async function saveProfileSettings(
     ),
   }));
   statusMessage.set("Settings saved!");
+}
+
+export async function saveProfileMode(mode: ProfileMode) {
+  const cfg = await invoke<Config>("save_profile_mode", { mode });
+  config.set(cfg);
+  portStatuses.set([]);
+  statusMessage.set(mode === "portless" ? "Portless mode enabled" : "Ports mode enabled");
+}
+
+export async function savePortlessSettings(
+  baseLocalPort: number,
+  scheme: "http" | "https",
+  hosts: string[],
+  gateways: PortlessGateway[]
+): Promise<string | null> {
+  try {
+    const cfg = await invoke<Config>("save_portless_settings", {
+      baseLocalPort,
+      scheme,
+      hosts,
+      gateways,
+    });
+    config.set(cfg);
+    await loadStatuses();
+    statusMessage.set("Portless gateways saved");
+    return null;
+  } catch (e) {
+    return String(e);
+  }
+}
+
+export async function discoverPortlessPorts(
+  pattern: string,
+  startPort: number,
+  endPort: number
+): Promise<PortlessDiscoveryResult | string> {
+  try {
+    return await invoke<PortlessDiscoveryResult>("discover_portless_ports", {
+      pattern,
+      startPort,
+      endPort,
+    });
+  } catch (e) {
+    return String(e);
+  }
 }
 
 export async function addPort(port: number): Promise<string | null> {

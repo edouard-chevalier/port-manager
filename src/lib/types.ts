@@ -8,11 +8,29 @@ export interface PortStatusInfo {
   process_name: string | null;
 }
 
+export type ProfileMode = "ports" | "portless";
+
+export interface PortlessGateway {
+  name: string;
+  host: string | null;
+  local_port: number;
+  remote_port: number;
+}
+
+export interface PortlessConfig {
+  base_local_port: number;
+  scheme: "http" | "https";
+  hosts: string[];
+  gateways: PortlessGateway[];
+}
+
 export interface Profile {
   name: string;
   host: string;
   user: string;
   ssh_port: number;
+  mode: ProfileMode;
+  portless: PortlessConfig;
   ports: number[];
   rate_limit_max: number;
   rate_limit_window_secs: number;
@@ -28,6 +46,12 @@ export interface SshHostEntry {
   hostname: string;
   user: string;
   port: number;
+}
+
+export interface PortlessDiscoveryResult {
+  scheme: "http" | "https";
+  host: string;
+  ports: number[];
 }
 
 export type AggregateStatus =

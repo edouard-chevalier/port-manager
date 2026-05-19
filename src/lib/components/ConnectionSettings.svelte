@@ -1,5 +1,11 @@
 <script lang="ts">
-  import { activeProfile, saveProfileSettings, statusMessage } from "../stores/portManager";
+  import {
+    activeProfile,
+    saveProfileMode,
+    saveProfileSettings,
+    statusMessage,
+  } from "../stores/portManager";
+  import type { ProfileMode } from "../types";
 
   let host = "";
   let user = "";
@@ -52,6 +58,12 @@
     await saveProfileSettings(host.trim(), user.trim(), port, max, window);
   }
 
+  async function handleModeChange(mode: ProfileMode) {
+    if (mode !== $activeProfile.mode) {
+      await saveProfileMode(mode);
+    }
+  }
+
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === "Enter") handleSave();
   }
@@ -92,6 +104,20 @@
   </div>
 
   <div class="bottom-row">
+    <div class="mode-toggle" aria-label="Profile mode">
+      <button
+        class:active={$activeProfile.mode === "ports"}
+        on:click={() => handleModeChange("ports")}
+      >
+        Ports
+      </button>
+      <button
+        class:active={$activeProfile.mode === "portless"}
+        on:click={() => handleModeChange("portless")}
+      >
+        Portless
+      </button>
+    </div>
     <div class="rate-limit-row">
       <span class="rate-limit-label">Rate limit</span>
       <div class="rate-limit-fields">
@@ -183,6 +209,28 @@
     background: #106ebe;
   }
 
+  .mode-toggle {
+    display: flex;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .mode-toggle button {
+    border: 0;
+    border-radius: 0;
+    background: white;
+    color: #374151;
+    padding: 6px 10px;
+  }
+
+  .mode-toggle button:hover,
+  .mode-toggle button.active {
+    background: #0078d4;
+    color: white;
+  }
+
   .bottom-row {
     display: flex;
     align-items: center;
@@ -197,6 +245,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    margin-left: auto;
   }
 
   .rate-limit-label {

@@ -47,10 +47,7 @@ pub fn run() {
                 let profile = s.config.active_profile().clone();
                 let profile_name = profile.name.clone();
                 let s = &mut *s;
-                let attempts = s
-                    .connection_attempts
-                    .entry(profile_name)
-                    .or_default();
+                let attempts = s.connection_attempts.entry(profile_name).or_default();
                 tunnel::start_all(&mut s.tunnels, &mut s.managed_ports, &profile, attempts);
             }
 
@@ -59,6 +56,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::save_profile_settings,
+            commands::save_profile_mode,
+            commands::save_portless_settings,
+            commands::discover_portless_ports,
             commands::add_port,
             commands::remove_port,
             commands::start_all,
@@ -130,12 +130,7 @@ fn build_tray_menu(
     if !port_items.is_empty() {
         all.push(&sep_ports);
     }
-    all.extend([
-        &start as &dyn IsMenuItem<_>,
-        &stop,
-        &sep2,
-        &quit,
-    ]);
+    all.extend([&start as &dyn IsMenuItem<_>, &stop, &sep2, &quit]);
     Menu::with_items(app, &all)
 }
 
@@ -161,10 +156,7 @@ fn setup_tray(app: &AppHandle, state: SharedState) -> tauri::Result<()> {
                 let profile = s.config.active_profile().clone();
                 let profile_name = profile.name.clone();
                 let s = &mut *s;
-                let attempts = s
-                    .connection_attempts
-                    .entry(profile_name)
-                    .or_default();
+                let attempts = s.connection_attempts.entry(profile_name).or_default();
                 tunnel::start_all(&mut s.tunnels, &mut s.managed_ports, &profile, attempts);
             }
             "stop" => {
@@ -214,10 +206,7 @@ async fn background_task(app: AppHandle, state: SharedState) {
             if auto {
                 let s = &mut *s;
                 let profile_name = profile.name.clone();
-                let attempts = s
-                    .connection_attempts
-                    .entry(profile_name)
-                    .or_default();
+                let attempts = s.connection_attempts.entry(profile_name).or_default();
                 tunnel::reconnect_dead(
                     &mut s.tunnels,
                     &mut s.tunnel_cooldowns,
@@ -227,23 +216,42 @@ async fn background_task(app: AppHandle, state: SharedState) {
                 );
             }
 
-            // Collect port info tuples while we hold the lock
-            // (port, has_tunnel, pid, is_intended, will_reconnect)
-            let info: Vec<(u16, bool, Option<u32>, bool, bool)> = profile
-                .ports
-                .iter()
-                .map(|&port| {
-                    let has_tunnel = s.tunnels.contains_key(&port);
-                    let pid = s.tunnels.get(&port).map(|p| p.pid);
-                    let is_intended = s.managed_ports.contains(&port);
-                    let in_cooldown = s.tunnel_cooldowns.contains_key(&port);
-                    let will_reconnect = auto && !in_cooldown;
-                    (port, has_tunnel, pid, is_intended, will_reconnect)
-                })
-                .collect();
+            if profile.mode == config::ProfileMode::Portless {
+                let info: Vec<(u16, bool, Option<u32>, bool, bool)> = profile
+                    .portless
+                    .gateways
+                    .iter()
+                    .map(|gateway| {
+                        let port = gateway.local_port;
+                        let has_tunnel = s.tunnels.contains_key(&port);
+                        let pid = s.tunnels.get(&port).map(|p| p.pid);
+                        let is_intended = s.managed_ports.contains(&port);
+                        let in_cooldown = s.tunnel_cooldowns.contains_key(&port);
+                        let will_reconnect = auto && !in_cooldown;
+                        (port, has_tunnel, pid, is_intended, will_reconnect)
+                    })
+                    .collect();
+                let name = profile.name.clone();
+                (info, name)
+            } else {
+                // Collect port info tuples while we hold the lock
+                // (port, has_tunnel, pid, is_intended, will_reconnect)
+                let info: Vec<(u16, bool, Option<u32>, bool, bool)> = profile
+                    .ports
+                    .iter()
+                    .map(|&port| {
+                        let has_tunnel = s.tunnels.contains_key(&port);
+                        let pid = s.tunnels.get(&port).map(|p| p.pid);
+                        let is_intended = s.managed_ports.contains(&port);
+                        let in_cooldown = s.tunnel_cooldowns.contains_key(&port);
+                        let will_reconnect = auto && !in_cooldown;
+                        (port, has_tunnel, pid, is_intended, will_reconnect)
+                    })
+                    .collect();
 
-            let name = profile.name.clone();
-            (info, name)
+                let name = profile.name.clone();
+                (info, name)
+            }
         };
         // Lock is released here
 
@@ -253,8 +261,10 @@ async fn background_task(app: AppHandle, state: SharedState) {
             .map(|(port, has_tunnel, pid, is_intended, will_reconnect)| {
                 let handle = tokio::task::spawn_blocking(move || {
                     let raw_status = status::probe_port(port, has_tunnel);
-                    let port_status = status::resolve_status(raw_status, is_intended, will_reconnect);
-                    let (owner_pid, process_name) = if port_status == status::PortStatus::PortInUse {
+                    let port_status =
+                        status::resolve_status(raw_status, is_intended, will_reconnect);
+                    let (owner_pid, process_name) = if port_status == status::PortStatus::PortInUse
+                    {
                         match status::get_port_owner(port) {
                             Some((op, name)) => (Some(op), Some(name)),
                             None => (None, None),
@@ -262,7 +272,13 @@ async fn background_task(app: AppHandle, state: SharedState) {
                     } else {
                         (None, None)
                     };
-                    status::PortStatusInfo { port, status: port_status, pid, owner_pid, process_name }
+                    status::PortStatusInfo {
+                        port,
+                        status: port_status,
+                        pid,
+                        owner_pid,
+                        process_name,
+                    }
                 });
                 handle
             })

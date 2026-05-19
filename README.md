@@ -1,13 +1,13 @@
 # Port Manager
 
-A Windows tray app for keeping SSH port forwards alive.
+A cross-platform tray app for keeping SSH port forwards alive.
 
 ## What it does
 
 - Forwards local ports over SSH (same as running `ssh -N -L ...` by hand)
 - Watches for dead tunnels and reconnects them automatically
-- Lives in the system tray — right-click to see which ports are up at a glance
-- Starts with Windows if you want it to
+- Lives in the system tray/menu bar — right-click to see which ports are up at a glance
+- Starts with your OS if you want it to
 
 ## Getting started
 
@@ -65,7 +65,13 @@ The system tray context menu shows which profile is currently active, along with
 
 ## Configuration
 
-Settings are saved to `%APPDATA%\com.portmanager.app\config.json`. The config file stores all profiles and tracks which one is active:
+Settings are saved in the app data directory for your OS:
+
+- macOS: `~/Library/Application Support/com.portmanager.app/config.json`
+- Windows: `%APPDATA%\com.portmanager.app\config.json`
+- Linux: usually `~/.local/share/com.portmanager.app/config.json`
+
+The config file stores all profiles and tracks which one is active:
 
 ```json
 {
