@@ -39,12 +39,49 @@ jobs:
             - **PortManager_*_x64-setup.exe** — NSIS installer (recommended)
             - **PortManager_*_x64_en-US.msi** — MSI installer
             - **port-manager.exe** — Portable executable (no install needed)
+            - **PortManager_*_aarch64.dmg** — macOS Apple Silicon disk image
             - **PortManager_*_amd64.AppImage** — Linux AppImage (works on most distros)
             - **PortManager_*_linux_x64.tar.gz** — Linux portable archive
 
             After first launch, tick **Run on startup** in the app to register it with Windows.
           releaseDraft: false
           prerelease: false
+
+  release-macos:
+    runs-on: macos-latest
+    needs: release-windows
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and publish macOS DMG
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: PortManager v__VERSION__
+          releaseDraft: false
+          prerelease: false
+          args: --target aarch64-apple-darwin --bundles dmg
 
   release-linux:
     runs-on: ubuntu-22.04

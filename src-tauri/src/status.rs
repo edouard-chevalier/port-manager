@@ -190,7 +190,45 @@ pub fn get_port_owner(port: u16) -> Option<(u32, String)> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub fn get_port_owner(port: u16) -> Option<(u32, String)> {
+    use std::process::Command;
+
+    let output = Command::new("lsof")
+        .args([
+            "-nP",
+            &format!("-iTCP:{}", port),
+            "-sTCP:LISTEN",
+            "-Fp",
+            "-Fc",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut pid = None;
+    let mut process_name = None;
+
+    for line in stdout.lines() {
+        if let Some(value) = line.strip_prefix('p') {
+            pid = value.parse::<u32>().ok();
+        } else if let Some(value) = line.strip_prefix('c') {
+            process_name = Some(value.to_string());
+        }
+
+        if let (Some(pid), Some(name)) = (pid, process_name.as_ref()) {
+            return Some((pid, name.clone()));
+        }
+    }
+
+    pid.map(|pid| (pid, format!("PID {}", pid)))
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn get_port_owner(_port: u16) -> Option<(u32, String)> {
     None
 }
@@ -215,7 +253,24 @@ pub fn kill_process(pid: u32) -> Result<(), String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub fn kill_process(pid: u32) -> Result<(), String> {
+    use std::process::Command;
+
+    let output = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output()
+        .map_err(|e| format!("Failed to run kill: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("kill failed: {}", stderr.trim()))
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn kill_process(_pid: u32) -> Result<(), String> {
-    Err("kill_process is only supported on Windows".to_string())
+    Err("kill_process is only supported on Windows and macOS".to_string())
 }

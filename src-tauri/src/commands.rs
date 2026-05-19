@@ -1,9 +1,21 @@
+use serde::Serialize;
+use std::process::Command;
 use tauri::{AppHandle, Manager, State};
 
-use crate::config::{save_config, scan_ssh_config, Config, Profile, SshHostEntry};
+use crate::config::{
+    save_config, scan_ssh_config, Config, PortlessConfig, PortlessGateway, Profile, ProfileMode,
+    SshHostEntry,
+};
 use crate::state::SharedState;
 use crate::status::{get_port_owner, probe_port, resolve_status, PortStatusInfo};
 use crate::tunnel;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PortlessDiscoveryResult {
+    pub scheme: String,
+    pub host: String,
+    pub ports: Vec<u16>,
+}
 
 // ---- Config Commands ----
 
@@ -33,6 +45,190 @@ pub fn save_profile_settings(
     }
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     save_config(&data_dir, &s.config)
+}
+
+#[tauri::command]
+pub fn save_profile_mode(
+    app: AppHandle,
+    state: State<SharedState>,
+    mode: ProfileMode,
+) -> Result<Config, String> {
+    let mut s = state.lock().unwrap();
+    {
+        let s = &mut *s;
+        tunnel::stop_all(&mut s.tunnels, &mut s.managed_ports);
+        s.tunnel_cooldowns.clear();
+    }
+    s.config.active_profile_mut().mode = mode;
+
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    save_config(&data_dir, &s.config)?;
+    Ok(s.config.clone())
+}
+
+#[tauri::command]
+pub fn save_portless_settings(
+    app: AppHandle,
+    state: State<SharedState>,
+    base_local_port: u16,
+    scheme: String,
+    hosts: Vec<String>,
+    gateways: Vec<PortlessGateway>,
+) -> Result<Config, String> {
+    let normalized_scheme = scheme.trim().to_lowercase();
+    if normalized_scheme != "http" && normalized_scheme != "https" {
+        return Err("Scheme must be http or https".to_string());
+    }
+
+    let normalized_hosts = hosts
+        .into_iter()
+        .map(|host| host.trim().trim_end_matches('/').to_string())
+        .filter(|host| !host.is_empty())
+        .collect();
+
+    let mut normalized_gateways = Vec::with_capacity(gateways.len());
+    for gateway in gateways {
+        let name = gateway.name.trim().to_string();
+        if name.is_empty() {
+            return Err("Gateway name is required".to_string());
+        }
+        if gateway.local_port == 0 || gateway.remote_port == 0 {
+            return Err("Gateway ports must be between 1 and 65535".to_string());
+        }
+        if normalized_gateways
+            .iter()
+            .any(|g: &PortlessGateway| g.local_port == gateway.local_port)
+        {
+            return Err(format!("Local port {} is already used", gateway.local_port));
+        }
+        normalized_gateways.push(PortlessGateway {
+            name,
+            host: gateway
+                .host
+                .map(|host| host.trim().trim_end_matches('/').to_string())
+                .filter(|host| !host.is_empty()),
+            local_port: gateway.local_port,
+            remote_port: gateway.remote_port,
+        });
+    }
+
+    let mut s = state.lock().unwrap();
+    {
+        let profile = s.config.active_profile_mut();
+        profile.mode = ProfileMode::Portless;
+        profile.portless = PortlessConfig {
+            base_local_port,
+            scheme: normalized_scheme,
+            hosts: normalized_hosts,
+            gateways: normalized_gateways,
+        };
+    }
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    save_config(&data_dir, &s.config)?;
+    Ok(s.config.clone())
+}
+
+#[tauri::command]
+pub fn discover_portless_ports(
+    state: State<SharedState>,
+    pattern: String,
+    start_port: u16,
+    end_port: u16,
+) -> Result<PortlessDiscoveryResult, String> {
+    let profile = {
+        let s = state.lock().unwrap();
+        s.config.active_profile().clone()
+    };
+
+    if profile.host.is_empty() || profile.user.is_empty() {
+        return Err("Profile has no host/user configured".to_string());
+    }
+    if start_port == 0 || end_port == 0 || start_port > end_port {
+        return Err("Invalid scan range".to_string());
+    }
+
+    let parsed = parse_portless_pattern(&pattern)?;
+    let mut found = Vec::new();
+
+    for port in start_port..=end_port {
+        let url = format!("{}://{}:{}/", parsed.scheme, parsed.host, port);
+        let target = format!("{}@{}", profile.user, profile.host);
+        let output = Command::new("ssh")
+            .args([
+                "-p",
+                &profile.ssh_port.to_string(),
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "ServerAliveInterval=10",
+                "-o",
+                "ServerAliveCountMax=1",
+                &target,
+                "curl",
+                "-k",
+                "-sS",
+                "-I",
+                "--max-time",
+                "2",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                &url,
+            ])
+            .output()
+            .map_err(|e| format!("Failed to run ssh: {e}"))?;
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let code = stdout.trim().parse::<u16>().unwrap_or(0);
+        if (100..600).contains(&code) {
+            found.push(port);
+        }
+    }
+
+    Ok(PortlessDiscoveryResult {
+        scheme: parsed.scheme,
+        host: parsed.host,
+        ports: found,
+    })
+}
+
+struct PortlessPattern {
+    scheme: String,
+    host: String,
+}
+
+fn parse_portless_pattern(pattern: &str) -> Result<PortlessPattern, String> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return Err("Discovery pattern is required".to_string());
+    }
+
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{}", trimmed)
+    };
+    let without_wildcard = with_scheme.replace(":*", ":1");
+    let parsed = without_wildcard
+        .parse::<url::Url>()
+        .map_err(|_| "Discovery pattern must look like https://host:*".to_string())?;
+    let scheme = parsed.scheme().to_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err("Discovery pattern scheme must be http or https".to_string());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "Discovery pattern must include a host".to_string())?
+        .to_string();
+
+    Ok(PortlessPattern { scheme, host })
 }
 
 #[tauri::command]
@@ -116,6 +312,8 @@ pub fn create_profile(
         host,
         user,
         ssh_port,
+        mode: ProfileMode::Ports,
+        portless: PortlessConfig::default(),
         ports: Vec::new(),
         rate_limit_max: 6,
         rate_limit_window_secs: 30,
@@ -208,6 +406,8 @@ pub fn import_ssh_profile(
         host: entry.hostname.clone(),
         user: entry.user.clone(),
         ssh_port: entry.port,
+        mode: ProfileMode::Ports,
+        portless: PortlessConfig::default(),
         ports: Vec::new(),
         rate_limit_max: 6,
         rate_limit_window_secs: 30,
@@ -259,6 +459,48 @@ pub fn get_port_statuses(state: State<SharedState>) -> Vec<PortStatusInfo> {
     let s = state.lock().unwrap();
     let profile = s.config.active_profile();
     let auto_reconnect = s.auto_reconnect;
+    if profile.mode == ProfileMode::Portless {
+        let port_info: Vec<(u16, bool, Option<u32>, bool, bool)> = profile
+            .portless
+            .gateways
+            .iter()
+            .map(|gateway| {
+                let port = gateway.local_port;
+                let has_tunnel = s.tunnels.contains_key(&port);
+                let pid = s.tunnels.get(&port).map(|p| p.pid);
+                let is_intended = s.managed_ports.contains(&port);
+                let in_cooldown = s.tunnel_cooldowns.contains_key(&port);
+                let will_reconnect = auto_reconnect && !in_cooldown;
+                (port, has_tunnel, pid, is_intended, will_reconnect)
+            })
+            .collect();
+        drop(s);
+
+        return port_info
+            .into_iter()
+            .map(|(port, has_tunnel, pid, is_intended, will_reconnect)| {
+                let raw_status = probe_port(port, has_tunnel);
+                let port_status = resolve_status(raw_status, is_intended, will_reconnect);
+                let (owner_pid, process_name) =
+                    if port_status == crate::status::PortStatus::PortInUse {
+                        match get_port_owner(port) {
+                            Some((op, name)) => (Some(op), Some(name)),
+                            None => (None, None),
+                        }
+                    } else {
+                        (None, None)
+                    };
+                PortStatusInfo {
+                    port,
+                    status: port_status,
+                    pid,
+                    owner_pid,
+                    process_name,
+                }
+            })
+            .collect();
+    }
+
     let port_info: Vec<(u16, bool, Option<u32>, bool, bool)> = profile
         .ports
         .iter()
@@ -310,6 +552,48 @@ pub fn start_port(state: State<SharedState>, port: u16) -> Result<(), String> {
     let mut s = state.lock().unwrap();
     let profile = s.config.active_profile().clone();
 
+    if profile.mode == ProfileMode::Portless {
+        let gateway = profile
+            .portless
+            .gateways
+            .iter()
+            .find(|gateway| gateway.local_port == port)
+            .ok_or_else(|| format!("Portless gateway on port {} not found", port))?;
+        if profile.host.is_empty() || profile.user.is_empty() {
+            return Err("Profile has no host/user configured".to_string());
+        }
+        if s.tunnels.contains_key(&port) {
+            return Err(format!("Gateway {} is already managed", gateway.name));
+        }
+        if crate::status::is_local_port_bound(port) {
+            return Err(format!(
+                "Port {} is already in use by another process",
+                port
+            ));
+        }
+
+        let profile_name = profile.name.clone();
+        let s = &mut *s;
+        let attempts = s.connection_attempts.entry(profile_name).or_default();
+
+        if !tunnel::can_connect(
+            attempts,
+            profile.rate_limit_max,
+            profile.rate_limit_window_secs,
+        ) {
+            return Err("Rate limit reached — try again shortly".to_string());
+        }
+        tunnel::record_attempt(attempts);
+
+        return match tunnel::spawn_portless_gateway(gateway, &profile) {
+            Ok(proc) => {
+                s.tunnels.insert(port, proc);
+                s.managed_ports.insert(port);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+    }
     if profile.host.is_empty() || profile.user.is_empty() {
         return Err("Profile has no host/user configured".to_string());
     }
@@ -387,7 +671,67 @@ pub fn set_startup_enabled(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub fn set_startup_enabled(enabled: bool) -> Result<(), String> {
+    use std::fs;
+
+    fn launch_agent_path() -> Result<std::path::PathBuf, String> {
+        let home = dirs::home_dir().ok_or_else(|| "Cannot resolve home directory".to_string())?;
+        Ok(home
+            .join("Library")
+            .join("LaunchAgents")
+            .join("com.portmanager.app.plist"))
+    }
+
+    fn xml_escape(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    }
+
+    let plist_path = launch_agent_path()?;
+
+    if enabled {
+        let launch_agents_dir = plist_path
+            .parent()
+            .ok_or_else(|| "Invalid LaunchAgents directory".to_string())?;
+        fs::create_dir_all(launch_agents_dir).map_err(|e| e.to_string())?;
+
+        let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe_path = xml_escape(&exe_path.to_string_lossy());
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.portmanager.app</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+"#,
+            exe_path
+        );
+        fs::write(&plist_path, plist).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    if plist_path.exists() {
+        fs::remove_file(&plist_path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 #[tauri::command]
 pub fn set_startup_enabled(enabled: bool) -> Result<(), String> {
     #[cfg(target_os = "linux")]
@@ -434,7 +778,7 @@ pub fn set_startup_enabled(enabled: bool) -> Result<(), String> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = enabled;
-        Err("Startup registration is only supported on Windows and Linux".to_string())
+        Err("Startup registration is only supported on Windows, macOS, and Linux".to_string())
     }
 }
 
@@ -453,7 +797,20 @@ pub fn get_startup_enabled() -> bool {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub fn get_startup_enabled() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+
+    home.join("Library")
+        .join("LaunchAgents")
+        .join("com.portmanager.app.plist")
+        .exists()
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 #[tauri::command]
 pub fn get_startup_enabled() -> bool {
     #[cfg(target_os = "linux")]

@@ -5,8 +5,10 @@
   import ConnectionSettings from "./lib/components/ConnectionSettings.svelte";
   import Header from "./lib/components/Header.svelte";
   import PortList from "./lib/components/PortList.svelte";
+  import PortlessGateway from "./lib/components/PortlessGateway.svelte";
   import ProfileSelector from "./lib/components/ProfileSelector.svelte";
   import {
+    activeProfile,
     loadConfig,
     loadSshHosts,
     loadStartupStatus,
@@ -46,7 +48,11 @@
   <Header />
   <ProfileSelector />
   <ConnectionSettings />
-  <PortList />
+  {#if $activeProfile.mode === "portless"}
+    <PortlessGateway />
+  {:else}
+    <PortList />
+  {/if}
   <ActionBar />
   <p class="status-bar">{$statusMessage}</p>
 </main>
